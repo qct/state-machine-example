@@ -1,6 +1,8 @@
 package com.example.orderservice;
 
 import java.util.Date;
+import java.util.Optional;
+import java.util.UUID;
 import javax.persistence.Entity;
 import javax.persistence.GeneratedValue;
 import javax.persistence.Id;
@@ -25,6 +27,9 @@ import org.springframework.statemachine.config.builders.StateMachineStateConfigu
 import org.springframework.statemachine.config.builders.StateMachineTransitionConfigurer;
 import org.springframework.statemachine.listener.StateMachineListenerAdapter;
 import org.springframework.statemachine.state.State;
+import org.springframework.statemachine.support.DefaultStateMachineContext;
+import org.springframework.statemachine.support.StateMachineInterceptorAdapter;
+import org.springframework.statemachine.transition.Transition;
 import org.springframework.stereotype.Component;
 import org.springframework.stereotype.Service;
 
@@ -49,39 +54,137 @@ enum OrderStates {
     CANCELLED
 }
 
+@Service
+class OrderService {
 
+    private final OrderRepository orderRepository;
+    private final StateMachineFactory<OrderStates, OrderEvents> factory;
+
+    private static final String ORDER_ID_HEADER = "orderId";
+
+    OrderService(OrderRepository orderRepository, StateMachineFactory<OrderStates, OrderEvents> factory) {
+        this.orderRepository = orderRepository;
+        this.factory = factory;
+    }
+
+    Order create(Date when) {
+        return this.orderRepository.save(new Order(when, OrderStates.SUBMITTED));
+    }
+
+    Order byId(Long id) {
+        return this.orderRepository.findById(id).orElse(null);
+    }
+
+    StateMachine<OrderStates, OrderEvents> fulfill(Long orderId) {
+        StateMachine<OrderStates, OrderEvents> sm = this.build(orderId);
+        Message<OrderEvents> fulfillMessage = MessageBuilder.withPayload(OrderEvents.FULFILL)
+            .setHeader(ORDER_ID_HEADER, orderId)
+            .build();
+        sm.sendEvent(fulfillMessage);
+        return sm;
+    }
+
+    StateMachine<OrderStates, OrderEvents> pay(Long orderId, String paymentConfirmationNumber) {
+        StateMachine<OrderStates, OrderEvents> sm = this.build(orderId);
+
+        Message<OrderEvents> paymentMessage = MessageBuilder.withPayload(OrderEvents.PAY)
+            .setHeader(ORDER_ID_HEADER, orderId)
+            .setHeader("paymentConfirmationNumber", paymentConfirmationNumber)
+            .build();
+
+        sm.sendEvent(paymentMessage);
+        return sm;
+    }
+
+    private StateMachine<OrderStates, OrderEvents> build(Long orderId) {
+        Order order = this.orderRepository.findById(orderId).orElse(null);
+        String orderIdKey = Long.toString(order.getId());
+        StateMachine<OrderStates, OrderEvents> sm = this.factory.getStateMachine(orderIdKey);
+        sm.stop();
+        sm.getStateMachineAccessor()
+            .doWithAllRegions(sma -> {
+
+                sma.addStateMachineInterceptor(new StateMachineInterceptorAdapter<OrderStates, OrderEvents>() {
+
+                    @Override
+                    public void preStateChange(State<OrderStates, OrderEvents> state, Message<OrderEvents> message,
+                        Transition<OrderStates, OrderEvents> transition,
+                        StateMachine<OrderStates, OrderEvents> stateMachine) {
+
+                        Optional.ofNullable(message).ifPresent(msg ->
+                            Optional.ofNullable(Long.class.cast(msg.getHeaders().getOrDefault(ORDER_ID_HEADER, -1L)))
+                                .ifPresent(orderId1 -> {
+                                    Order order1 = orderRepository.findById(orderId1).orElse(null);
+                                    order1.setOrderState(state.getId());
+                                    orderRepository.save(order1);
+                                }));
+                    }
+                });
+                sma.resetStateMachine(new DefaultStateMachineContext<>(order.getOrderState(), null, null, null));
+            });
+        sm.start();
+        return sm;
+    }
+}
 
 @Log
 @Component
 class Runner implements ApplicationRunner {
 
-    private final StateMachineFactory<OrderStates, OrderEvents> factory;
+    private final OrderService orderService;
 
-    Runner(StateMachineFactory<OrderStates, OrderEvents> factory) {
-        this.factory = factory;
+    Runner(OrderService orderService) {
+        this.orderService = orderService;
     }
 
     @Override
     public void run(ApplicationArguments args) throws Exception {
-        Long orderId = 13232L;
-        StateMachine<OrderStates, OrderEvents> machine = this.factory.getStateMachine(Long.toString(orderId));
-        machine.getExtendedState().getVariables().putIfAbsent("orderId", orderId);
-        machine.start();
-        log.info("current state: " + machine.getState().getId().name());
-        machine.sendEvent(OrderEvents.PAY);
-        log.info("current state: " + machine.getState().getId().name());
+        Order order = this.orderService.create(new Date());
+        StateMachine<OrderStates, OrderEvents> paymentStateMachine = orderService.pay(order.getId(), UUID.randomUUID()
+            .toString());
+        log.info("after calling pay(): " + paymentStateMachine.getState().getId().name());
+        log.info("order: " + orderService.byId(order.getId()));
 
-        Message<OrderEvents> eventsMessage = MessageBuilder
-            .withPayload(OrderEvents.FULFILL)
-            .setHeader("a", "b")
-            .build();
-        machine.sendEvent(eventsMessage);
-        log.info("current state: " + machine.getState().getId().name());
+        StateMachine<OrderStates, OrderEvents> fulfilledStateMachine = orderService.fulfill(order.getId());
+        log.info("after calling fulfill(): " + fulfilledStateMachine.getState().getId().name());
+        log.info("order: " + orderService.byId(order.getId()));
+
+
     }
 
 }
 
+interface OrderRepository extends JpaRepository<Order, Long> {
 
+}
+
+@Entity(name = "ORDERS")
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+class Order {
+
+    @Id
+    @GeneratedValue
+    private Long id;
+    private Date datetime;
+
+    private String state;
+
+    public Order(Date date, OrderStates states) {
+        this.datetime = date;
+        this.state = states.name();
+    }
+
+    public OrderStates getOrderState() {
+        return OrderStates.valueOf(this.state);
+    }
+
+    public void setOrderState(OrderStates state) {
+        this.state = state.name();
+    }
+
+}
 
 @Log
 @Configuration
